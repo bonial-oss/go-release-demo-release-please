@@ -12,6 +12,10 @@ on:
         description: "Type 'release' to force-cut a release from current main (skips the Release-PR gate)"
         required: false
         default: ""
+      force_release_version:
+        description: "Force-cut this version (e.g. '1.0.0' without the 'v' prefix). Bypasses release-please detection entirely — for recovering from a stuck manifest state. Requires confirm=release."
+        required: false
+        default: ""
 
 permissions: read-all
 
@@ -26,35 +30,93 @@ jobs:
       contents: write        # create Release PR, tag the release commit
       pull-requests: write   # open/update the Release PR
     outputs:
-      release_created: ${{ steps.rp.outputs.release_created }}
-      version:         ${{ steps.rp.outputs.version }}
-      tag_name:        ${{ steps.rp.outputs.tag_name }}
+      release_created: ${{ steps.decide.outputs.release_created }}
+      version:         ${{ steps.decide.outputs.version }}
+      tag_name:        ${{ steps.decide.outputs.tag_name }}
     steps:
+      - name: Checkout (needed for manifest-delta fallback detection)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # HEAD + HEAD~1 for manifest-delta diff
+
       - name: Run release-please
         id: rp
         uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          # release-please's GITHUB_TOKEN — comes from the workflow token
-          # by default, so no explicit token: input needed.
 
-      - name: Dry-run gate for workflow_dispatch
-        # If someone dispatched the workflow manually without confirm=release,
-        # override release_created to false so downstream jobs don't fire.
-        # Push events skip this gate entirely.
-        if: github.event_name == 'workflow_dispatch'
+      - name: Consolidate release decision (release-please + fallbacks)
+        # release-please with `skip-github-tag: true` + `skip-github-release: true`
+        # does NOT emit `release_created=true` on Release-PR merge — the workflow
+        # is expected to own tag+release creation. Fall back to two other signals:
+        #   (a) manifest-delta: `.release-please-manifest.json` version differs
+        #       from HEAD~1 → a Release PR was just merged.
+        #   (b) `force_release_version` input on workflow_dispatch → operator
+        #       override for recovery from a stuck manifest state.
+        # (a) is the automatic path for normal Release-PR merges; (b) is the
+        # escape hatch.
+        id: decide
         shell: bash
         env:
-          CONFIRM: ${{ inputs.confirm }}
-          CREATED: ${{ steps.rp.outputs.release_created }}
+          RP_CREATED: ${{ steps.rp.outputs.release_created }}
+          RP_VERSION: ${{ steps.rp.outputs.version }}
+          RP_TAG:     ${{ steps.rp.outputs.tag_name }}
+          FORCE:      ${{ inputs.force_release_version }}
+          CONFIRM:    ${{ inputs.confirm }}
+          EVENT:      ${{ github.event_name }}
         run: |
           set -euo pipefail
-          if [ "$CREATED" = "true" ] && [ "$CONFIRM" != "release" ]; then
-            echo "::notice::Dry-run: release-please would cut a release. Re-dispatch with confirm=release to proceed."
-            # We can't mutate step outputs post-hoc; instead, the downstream
-            # jobs' if: conditions include this event-type + confirm check.
+
+          # 1) workflow_dispatch force-cut path — requires confirm=release
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$FORCE" ]; then
+            if [ "$CONFIRM" != "release" ]; then
+              echo "::error::force_release_version was set but confirm != 'release'. Re-dispatch with both."
+              exit 1
+            fi
+            echo "::notice::Force-cut path: version=${FORCE}"
+            {
+              echo "release_created=true"
+              echo "version=${FORCE}"
+              echo "tag_name=v${FORCE}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          # 2) release-please's own signal — honor it
+          if [ "$RP_CREATED" = "true" ]; then
+            # workflow_dispatch dry-run gate: skip downstream unless confirm=release
+            if [ "$EVENT" = "workflow_dispatch" ] && [ "$CONFIRM" != "release" ]; then
+              echo "::notice::Dry-run: release-please would cut ${RP_TAG}. Re-dispatch with confirm=release to proceed."
+              echo "release_created=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            {
+              echo "release_created=true"
+              echo "version=${RP_VERSION}"
+              echo "tag_name=${RP_TAG}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 3) manifest-delta fallback — release-please with both skip flags won't
+          # emit release_created on Release-PR merge, but the manifest change is
+          # the reliable signal that a merge just landed.
+          CURRENT=$(jq -r '."."' .release-please-manifest.json)
+          PREV=$(git show HEAD~1:.release-please-manifest.json 2>/dev/null | jq -r '."."' || echo "0.0.0")
+          if [ "$CURRENT" != "$PREV" ]; then
+            echo "::notice::Manifest-delta fallback: ${PREV} -> ${CURRENT}"
+            {
+              echo "release_created=true"
+              echo "version=${CURRENT}"
+              echo "tag_name=v${CURRENT}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 4) Nothing to release
+          echo "No release warranted. release-please: created=${RP_CREATED}; manifest unchanged at ${CURRENT}."
+          echo "release_created=false" >> "$GITHUB_OUTPUT"
 
   goreleaser:
     needs: release-please
